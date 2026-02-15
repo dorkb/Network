@@ -197,6 +197,20 @@ class AlertAnalyzer:
 
         value = holdings * current_price
 
+        # Buy target prices
+        # 1. EMA(21) support — natural bounce level in an uptrend
+        buy_support = ema_s
+        # 2. Recent low — tested support
+        buy_low = df["low"].tail(50).min()
+        # 3. 5% dip from recent high
+        buy_dip = recent_high * 0.95
+
+        # Pick the best target: highest of the three (closest realistic entry)
+        buy_targets = sorted([buy_support, buy_low, buy_dip], reverse=True)
+        # Primary: EMA support if above recent low, otherwise recent low
+        buy_price = buy_support if buy_support > buy_low else buy_low
+        buy_discount = ((buy_price - current_price) / current_price) * 100
+
         return {
             "pair": pair,
             "coin": pair.replace("/USD", ""),
@@ -211,6 +225,11 @@ class AlertAnalyzer:
             "alert": alert,
             "reasons": reasons,
             "strength": strength,
+            "buy_price": buy_price,
+            "buy_support": buy_support,
+            "buy_low": buy_low,
+            "buy_dip": buy_dip,
+            "buy_discount": buy_discount,
         }
 
 
@@ -349,6 +368,19 @@ def render_coin_panel(data, price_history):
     content.append(f"{vol:.1f}x avg", style="bright_white")
     if vol >= 2.0:
         content.append("  HIGH", style="bold yellow")
+    content.append("\n\n")
+
+    # Buy targets
+    buy_price = data["buy_price"]
+    buy_discount = data["buy_discount"]
+    content.append("  Buy at:  ", style="dim")
+    content.append(format_usd(buy_price), style="bold bright_green")
+    content.append(f"  ({buy_discount:+.1f}%)", style="green" if buy_discount < 0 else "red")
+    content.append("\n")
+    content.append("    EMA support: ", style="dim")
+    content.append(f"{format_usd(data['buy_support'])}", style="dim")
+    content.append("  |  Recent low: ", style="dim")
+    content.append(f"{format_usd(data['buy_low'])}", style="dim")
     content.append("\n\n")
 
     # Alert box
