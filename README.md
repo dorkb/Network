@@ -1,11 +1,11 @@
 # Network
 
-Raspberry Pi terminal tools — network dashboard, crypto trading bot, and buy signal alerts.
+Raspberry Pi tools — network dashboard, crypto trading bot, buy signal alerts, and a web dashboard.
 
 ## Setup
 
 ```bash
-pip3 install ccxt pandas ta rich psutil
+pip3 install ccxt pandas ta rich psutil flask
 ```
 
 ## netdash.py
@@ -61,6 +61,9 @@ python3 alerts.py
 - Monitors XRP and SOL (configurable) for buy-the-dip signals
 - Tracks your holdings and their USD value
 - RSI oversold detection, EMA crossover alerts, price drop alerts, volume spikes
+- Bollinger Bands, MACD momentum, multi-timeframe RSI, support level detection
+- Bottom score (0-10) — aggregates all signals to identify dip-buying opportunities
+- Buy target prices based on EMA support and recent lows
 - Alert levels: `WAIT` → `DIP ALERT` → `BUY ZONE` → `BUY SIGNAL` → `STRONG BUY`
 - Overbought/caution warnings when it's time to consider selling
 - Alert history log
@@ -74,10 +77,28 @@ python3 alerts.py
 | `strategy.rsi_buy_zone` | `35` | RSI level for buy zone alert |
 | `poll_interval_seconds` | `60` | How often to check prices |
 
+## web_alerts.py
+
+Web version of the alerts dashboard — accessible from your phone, tablet, or any device on your network.
+
+```
+python3 web_alerts.py
+```
+
+Then open `http://<pi-ip>:5000` on any device on your WiFi.
+
+**Features:**
+- Same indicators as alerts.py — RSI, Bollinger Bands, MACD, bottom score, buy targets
+- Real-time updates via Server-Sent Events (SSE)
+- Dark modern UI with animated bars, sparkline charts, and card layout
+- Responsive — works on phone and desktop
+- No extra config needed — uses the same `alerts_config.json`
+
 ## Built with
 
 - Python 3.13 on Raspberry Pi 5
 - [rich](https://github.com/Textualize/rich) for terminal UI
+- [Flask](https://flask.palletsprojects.com/) for web dashboard
 - [ccxt](https://github.com/ccxt/ccxt) for exchange API
 - [ta](https://github.com/bukosabino/ta) for technical indicators
 - Claude Code
