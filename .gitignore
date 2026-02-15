@@ -1,0 +1,6 @@
+accounts.txt
+config.json
+trades.db
+__pycache__/
+.claude/
+*.pyc
