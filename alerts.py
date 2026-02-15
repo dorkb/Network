@@ -125,7 +125,7 @@ class AlertAnalyzer:
         self.rsi_overbought = config.rsi_overbought
         self.vol_period = config.volume_sma_period
 
-    def analyze(self, pair, df, holdings, current_price):
+    def analyze(self, pair, df, holdings, current_price, df_1h=None):
         df = df.copy()
         df["ema_fast"] = ta_lib.trend.ema_indicator(df["close"], window=self.ema_fast)
         df["ema_slow"] = ta_lib.trend.ema_indicator(df["close"], window=self.ema_slow)
@@ -133,12 +133,66 @@ class AlertAnalyzer:
         df["vol_sma"] = df["volume"].rolling(window=self.vol_period).mean()
         df["vol_ratio"] = df["volume"] / df["vol_sma"]
 
+        # Bollinger Bands (20-period, 2 std dev)
+        bb = ta_lib.volatility.BollingerBands(df["close"], window=20, window_dev=2)
+        df["bb_upper"] = bb.bollinger_hband()
+        df["bb_lower"] = bb.bollinger_lband()
+        df["bb_mid"] = bb.bollinger_mavg()
+        df["bb_pct"] = bb.bollinger_pband()  # 0 = at lower, 1 = at upper
+
+        # MACD
+        macd_ind = ta_lib.trend.MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["macd"] = macd_ind.macd()
+        df["macd_signal"] = macd_ind.macd_signal()
+        df["macd_hist"] = macd_ind.macd_diff()
+
         curr = df.iloc[-1]
         prev = df.iloc[-2]
         rsi = curr["rsi"]
         ema_f = curr["ema_fast"]
         ema_s = curr["ema_slow"]
         vol_ratio = curr["vol_ratio"] if not pd.isna(curr["vol_ratio"]) else 0.0
+
+        # Bollinger values
+        bb_lower = curr["bb_lower"] if not pd.isna(curr["bb_lower"]) else 0
+        bb_upper = curr["bb_upper"] if not pd.isna(curr["bb_upper"]) else 0
+        bb_mid = curr["bb_mid"] if not pd.isna(curr["bb_mid"]) else 0
+        bb_pct = curr["bb_pct"] if not pd.isna(curr["bb_pct"]) else 0.5
+
+        # MACD values
+        macd_val = curr["macd"] if not pd.isna(curr["macd"]) else 0
+        macd_sig = curr["macd_signal"] if not pd.isna(curr["macd_signal"]) else 0
+        macd_hist = curr["macd_hist"] if not pd.isna(curr["macd_hist"]) else 0
+        macd_hist_prev = prev["macd_hist"] if not pd.isna(prev["macd_hist"]) else 0
+
+        # MACD bullish divergence: histogram turning up from negative
+        macd_turning_up = macd_hist > macd_hist_prev and macd_hist < 0
+        macd_cross_up = macd_val > macd_sig and prev["macd"] <= prev["macd_signal"]
+
+        # 1h RSI (bigger picture)
+        rsi_1h = None
+        if df_1h is not None and len(df_1h) >= 20:
+            df_1h = df_1h.copy()
+            df_1h["rsi"] = ta_lib.momentum.rsi(df_1h["close"], window=self.rsi_period)
+            rsi_1h = df_1h.iloc[-1]["rsi"]
+            if pd.isna(rsi_1h):
+                rsi_1h = None
+
+        # Support levels: find price levels where bounces happened
+        lows = df["low"].tail(100)
+        supports = []
+        for i in range(2, len(lows) - 2):
+            if lows.iloc[i] <= lows.iloc[i-1] and lows.iloc[i] <= lows.iloc[i-2] and \
+               lows.iloc[i] <= lows.iloc[i+1] and lows.iloc[i] <= lows.iloc[i+2]:
+                supports.append(lows.iloc[i])
+        # Keep unique-ish supports (within 0.5% are the same level)
+        unique_supports = []
+        for s in sorted(supports):
+            if not unique_supports or abs(s - unique_supports[-1]) / unique_supports[-1] > 0.005:
+                unique_supports.append(s)
+        # Only supports below current price
+        support_levels = [s for s in unique_supports if s < current_price]
+        support_levels = support_levels[-3:]  # Keep top 3 nearest
 
         recent_high = df["high"].tail(50).max()
         drop_pct = ((current_price - recent_high) / recent_high) * 100
@@ -198,18 +252,42 @@ class AlertAnalyzer:
         value = holdings * current_price
 
         # Buy target prices
-        # 1. EMA(21) support — natural bounce level in an uptrend
         buy_support = ema_s
-        # 2. Recent low — tested support
         buy_low = df["low"].tail(50).min()
-        # 3. 5% dip from recent high
         buy_dip = recent_high * 0.95
-
-        # Pick the best target: highest of the three (closest realistic entry)
-        buy_targets = sorted([buy_support, buy_low, buy_dip], reverse=True)
-        # Primary: EMA support if above recent low, otherwise recent low
         buy_price = buy_support if buy_support > buy_low else buy_low
         buy_discount = ((buy_price - current_price) / current_price) * 100
+
+        # Bottom score (0-10): how close are we to a bottom?
+        bottom_score = 0
+        bottom_signals = []
+        if rsi <= 30:
+            bottom_score += 3
+            bottom_signals.append("RSI oversold")
+        elif rsi <= 40:
+            bottom_score += 1
+            bottom_signals.append("RSI getting low")
+        if bb_pct <= 0.05:
+            bottom_score += 3
+            bottom_signals.append("At Bollinger lower band")
+        elif bb_pct <= 0.2:
+            bottom_score += 1
+            bottom_signals.append("Near Bollinger lower band")
+        if macd_turning_up:
+            bottom_score += 2
+            bottom_signals.append("MACD momentum turning up")
+        if macd_cross_up:
+            bottom_score += 2
+            bottom_signals.append("MACD bullish crossover")
+        if rsi_1h is not None and rsi_1h <= 35:
+            bottom_score += 2
+            bottom_signals.append(f"1h RSI {rsi_1h:.0f} oversold")
+        if vol_ratio >= 2.0 and rsi < 40:
+            bottom_score += 1
+            bottom_signals.append("High volume at low RSI (capitulation?)")
+        if not bottom_signals:
+            bottom_signals.append("No bottom signals yet")
+        bottom_score = min(bottom_score, 10)
 
         return {
             "pair": pair,
@@ -218,6 +296,7 @@ class AlertAnalyzer:
             "holdings": holdings,
             "value": value,
             "rsi": rsi,
+            "rsi_1h": rsi_1h,
             "ema_fast": ema_f,
             "ema_slow": ema_s,
             "volume_ratio": vol_ratio,
@@ -230,6 +309,16 @@ class AlertAnalyzer:
             "buy_low": buy_low,
             "buy_dip": buy_dip,
             "buy_discount": buy_discount,
+            "bb_lower": bb_lower,
+            "bb_upper": bb_upper,
+            "bb_pct": bb_pct,
+            "macd": macd_val,
+            "macd_signal": macd_sig,
+            "macd_hist": macd_hist,
+            "macd_turning_up": macd_turning_up,
+            "support_levels": support_levels,
+            "bottom_score": bottom_score,
+            "bottom_signals": bottom_signals,
         }
 
 
@@ -383,6 +472,94 @@ def render_coin_panel(data, price_history):
     content.append(f"{format_usd(data['buy_low'])}", style="dim")
     content.append("\n\n")
 
+    # ── Bottom Score ──
+    bscore = data["bottom_score"]
+    bs_bar_w = 10
+    bs_fill = min(int((bscore / 10) * bs_bar_w), bs_bar_w)
+    if bscore >= 7:
+        bs_color = "bright_green"
+        bs_label = "LIKELY BOTTOM"
+    elif bscore >= 4:
+        bs_color = "yellow"
+        bs_label = "GETTING CLOSE"
+    else:
+        bs_color = "dim"
+        bs_label = "NOT YET"
+    content.append("  Bottom:  ", style="dim")
+    content.append("█" * bs_fill, style=bs_color)
+    content.append("░" * (bs_bar_w - bs_fill), style="dim")
+    content.append(f" {bscore}/10 ", style=f"bold {bs_color}")
+    content.append(bs_label, style=f"bold {bs_color}")
+    content.append("\n")
+    for sig in data["bottom_signals"]:
+        content.append(f"    · {sig}\n", style=bs_color)
+    content.append("\n")
+
+    # ── Bollinger Bands ──
+    bb_pct = data["bb_pct"]
+    bb_bar_w = 20
+    bb_pos = min(int(bb_pct * bb_bar_w), bb_bar_w - 1) if bb_pct >= 0 else 0
+    content.append("  BB:     ", style="dim")
+    bb_bar = list("─" * bb_bar_w)
+    bb_bar[0] = "▏"
+    bb_bar[-1] = "▕"
+    if bb_bar_w > 1:
+        mid = bb_bar_w // 2
+        bb_bar[mid] = "┊"
+    bb_bar[bb_pos] = "●"
+    for idx, ch in enumerate(bb_bar):
+        if ch == "●":
+            if bb_pct <= 0.2:
+                content.append(ch, style="bold bright_green")
+            elif bb_pct >= 0.8:
+                content.append(ch, style="bold red")
+            else:
+                content.append(ch, style="bold yellow")
+        else:
+            content.append(ch, style="dim")
+    content.append("  ", style="dim")
+    content.append(format_usd(data["bb_lower"]), style="green")
+    content.append(" / ", style="dim")
+    content.append(format_usd(data["bb_upper"]), style="red")
+    content.append("\n")
+
+    # ── MACD ──
+    content.append("  MACD:   ", style="dim")
+    macd_h = data["macd_hist"]
+    if macd_h > 0:
+        content.append(f"▲ {macd_h:.4f}", style="green")
+    else:
+        content.append(f"▼ {macd_h:.4f}", style="red")
+    if data["macd_turning_up"]:
+        content.append("  ↑ turning up", style="bold bright_green")
+    content.append("\n")
+
+    # ── 1h RSI ──
+    rsi_1h = data.get("rsi_1h")
+    if rsi_1h is not None:
+        rsi_1h_color = "green" if rsi_1h < 35 else "red" if rsi_1h > 65 else "yellow"
+        content.append("  1h RSI: ", style="dim")
+        content.append(f"{rsi_1h:.0f}", style=f"bold {rsi_1h_color}")
+        if rsi_1h <= 35:
+            content.append("  oversold on higher TF", style="bold green")
+        elif rsi_1h >= 65:
+            content.append("  overbought on higher TF", style="bold red")
+        content.append("\n")
+
+    # ── Support levels ──
+    supports = data["support_levels"]
+    if supports:
+        content.append("  Support: ", style="dim")
+        for j, s in enumerate(supports):
+            pct_away = ((s - price) / price) * 100
+            content.append(format_usd(s), style="cyan")
+            content.append(f" ({pct_away:+.1f}%)", style="dim")
+            if j < len(supports) - 1:
+                content.append("  ", style="dim")
+        content.append("\n")
+
+    content.append("\n")
+
     # Alert box
     content.append("  >> ", style="bright_white")
     content.append(alert, style=alert_style(alert))
@@ -432,7 +609,7 @@ def build_layout(num_coins):
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="coins", ratio=1),
-        Layout(name="history", size=10),
+        Layout(name="history", size=8),
         Layout(name="footer", size=5),
     )
     if num_coins == 2:
@@ -501,9 +678,21 @@ def main():
                             raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
                         )
 
+                        # Fetch 1h candles for multi-timeframe RSI
+                        df_1h = None
+                        try:
+                            raw_1h = exchange.fetch_ohlcv(pair, "1h", limit=100)
+                            df_1h = pd.DataFrame(
+                                raw_1h, columns=["timestamp", "open", "high", "low", "close", "volume"]
+                            )
+                            if len(df_1h) < 20:
+                                df_1h = None
+                        except Exception:
+                            pass
+
                         min_rows = config.ema_slow + 5
                         if len(df) >= min_rows:
-                            data = analyzer.analyze(pair, df, holdings, price)
+                            data = analyzer.analyze(pair, df, holdings, price, df_1h=df_1h)
                             coin_data[pair] = data
                             log_messages.append(
                                 f"{coin}: {format_usd(price)} | RSI {data['rsi']:.0f} | {data['alert']}"
