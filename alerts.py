@@ -500,12 +500,13 @@ def main():
 
             for i, w in enumerate(config.watchlist):
                 pair = w["pair"]
+                slot = layout["coins"][f"coin_{i}"]
                 if pair in coin_data:
-                    layout[f"coins"]["coin_{i}"].update(
+                    slot.update(
                         render_coin_panel(coin_data[pair], price_histories[pair])
                     )
                 else:
-                    layout[f"coins"]["coin_{i}"].update(
+                    slot.update(
                         Panel(Text("  Loading...", style="dim"),
                               title=f"[bold]{pair.replace('/USD', '')}[/]",
                               border_style="dim")
