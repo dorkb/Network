@@ -1,6 +1,12 @@
 # Network
 
-Raspberry Pi terminal tools — a live network dashboard and a crypto trading bot.
+Raspberry Pi terminal tools — network dashboard, crypto trading bot, and buy signal alerts.
+
+## Setup
+
+```bash
+pip3 install ccxt pandas ta rich psutil
+```
 
 ## netdash.py
 
@@ -18,46 +24,55 @@ python3 netdash.py
 - Active connections
 - Network stats (bytes, packets, errors)
 
-**Requirements:** `psutil`, `rich` (+ system tools: `iwconfig`, `ip`, `arp`)
-
 ## trader.py
 
-Crypto trading bot with a live TUI dashboard. Day trades DOGE/USD and monitors XRP + SOL for buy-the-dip alerts.
+DOGE day trading bot with a live TUI dashboard. EMA crossover + RSI + volume strategy. Paper trading by default.
 
 ```
 python3 trader.py
 ```
 
 **Features:**
-- **DOGE day trader** — EMA crossover + RSI + volume strategy, paper trading by default
-- **XRP/SOL buy alerts** — watches for oversold RSI, price dips, and golden crosses
-- **Risk management** — stop-loss, take-profit, daily loss limit, position sizing
-- **SQLite persistence** — trades and portfolio survive restarts
-- **Live dashboard** — sparklines, signal confidence bars, P&L tracking
+- EMA(9/21) crossover signals with RSI and volume confirmation
+- Stop-loss (4%), take-profit (8%), daily loss limit ($10)
+- Position sizing scales with signal confidence
+- SQLite persistence — trades and portfolio survive restarts
+- Paper trading by default — set `"live_trading": true` in `config.json` for real money
 
-**Requirements:** `ccxt`, `pandas`, `ta`, `rich`
-
-### Setup
-
-```bash
-pip3 install ccxt pandas ta rich psutil
-python3 trader.py    # auto-creates config.json on first run
-```
-
-Edit `config.json` to set your trading pair, strategy parameters, and API keys. Paper trading is on by default — set `"live_trading": true` to use real money.
-
-### Config
+**Config** (`config.json`, auto-created on first run):
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `trading.pair` | `DOGE/USD` | Coin the bot actively trades |
+| `trading.pair` | `DOGE/USD` | Coin the bot trades |
 | `trading.live_trading` | `false` | Paper mode by default |
-| `strategy.ema_fast_period` | `9` | Fast EMA window |
-| `strategy.ema_slow_period` | `21` | Slow EMA window |
 | `risk.stop_loss_pct` | `0.04` | 4% stop-loss |
 | `risk.take_profit_pct` | `0.08` | 8% take-profit |
 | `risk.daily_loss_limit_usd` | `10.0` | Stop trading after $10 loss/day |
-| `watchlist` | XRP, SOL | Coins to monitor for buy alerts |
+
+## alerts.py
+
+Buy signal indicator that watches your crypto holdings for dip-buying opportunities.
+
+```
+python3 alerts.py
+```
+
+**Features:**
+- Monitors XRP and SOL (configurable) for buy-the-dip signals
+- Tracks your holdings and their USD value
+- RSI oversold detection, EMA crossover alerts, price drop alerts, volume spikes
+- Alert levels: `WAIT` → `DIP ALERT` → `BUY ZONE` → `BUY SIGNAL` → `STRONG BUY`
+- Overbought/caution warnings when it's time to consider selling
+- Alert history log
+
+**Config** (`alerts_config.json`, auto-created on first run):
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `watchlist` | XRP (600), SOL (3) | Coins and holdings to monitor |
+| `strategy.rsi_oversold` | `30` | RSI level for strong buy alert |
+| `strategy.rsi_buy_zone` | `35` | RSI level for buy zone alert |
+| `poll_interval_seconds` | `60` | How often to check prices |
 
 ## Built with
 

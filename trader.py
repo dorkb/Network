@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""trader.py -- Crypto trading bot + buy alerts dashboard for Raspberry Pi"""
+"""trader.py -- DOGE day trading bot with live TUI dashboard for Raspberry Pi"""
 
 import collections
 import datetime
@@ -42,17 +42,12 @@ DEFAULT_CONFIG = {
         "poll_interval_seconds": 60,
         "live_trading": False,
     },
-    "watchlist": [
-        {"pair": "XRP/USD", "holdings": 600},
-        {"pair": "SOL/USD", "holdings": 3},
-    ],
     "strategy": {
         "ema_fast_period": 9,
         "ema_slow_period": 21,
         "rsi_period": 14,
         "rsi_overbought": 70,
         "rsi_oversold": 30,
-        "rsi_buy_zone": 35,
         "volume_sma_period": 20,
         "volume_threshold": 1.0,
     },
@@ -104,6 +99,10 @@ class Config:
         return self._data["trading"]["pair"]
 
     @property
+    def coin_name(self):
+        return self.pair.replace("/USD", "")
+
+    @property
     def timeframe(self):
         return self._data["trading"]["timeframe"]
 
@@ -114,10 +113,6 @@ class Config:
     @property
     def live_trading(self):
         return self._data["trading"]["live_trading"]
-
-    @property
-    def watchlist(self):
-        return self._data.get("watchlist", [])
 
     @property
     def ema_fast(self):
@@ -138,10 +133,6 @@ class Config:
     @property
     def rsi_oversold(self):
         return self._data["strategy"]["rsi_oversold"]
-
-    @property
-    def rsi_buy_zone(self):
-        return self._data["strategy"].get("rsi_buy_zone", 35)
 
     @property
     def volume_sma_period(self):
@@ -176,7 +167,7 @@ class Config:
         return self._data["risk"]["max_trade_usd"]
 
     @property
-    def initial_doge(self):
+    def initial_crypto(self):
         return self._data["paper"].get("initial_doge", 500.0)
 
 
@@ -232,13 +223,6 @@ class Database:
                 starting_value REAL NOT NULL,
                 realized_pnl REAL NOT NULL DEFAULT 0,
                 trades_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                pair TEXT NOT NULL,
-                alert_type TEXT NOT NULL,
-                message TEXT NOT NULL
             );
         """
         )
@@ -310,19 +294,6 @@ class Database:
                 (date_str, starting_value, pnl_delta),
             )
         self.conn.commit()
-
-    def log_alert(self, pair, alert_type, message):
-        self.conn.execute(
-            "INSERT INTO alerts (timestamp, pair, alert_type, message) VALUES (?, ?, ?, ?)",
-            (datetime.datetime.now().isoformat(), pair, alert_type, message),
-        )
-        self.conn.commit()
-
-    def get_recent_alerts(self, limit=10):
-        rows = self.conn.execute(
-            "SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-        return [dict(r) for r in rows]
 
 
 # ── Exchange Client ──────────────────────────────────────────────────────────
@@ -439,103 +410,6 @@ class Strategy:
         }
 
 
-# ── Buy Alert Analyzer ──────────────────────────────────────────────────────
-
-
-class AlertAnalyzer:
-    """Watches coins for buy-the-dip opportunities."""
-
-    def __init__(self, config):
-        self.rsi_buy_zone = config.rsi_buy_zone
-        self.rsi_oversold = config.rsi_oversold
-        self.ema_fast = config.ema_fast
-        self.ema_slow = config.ema_slow
-        self.rsi_period = config.rsi_period
-        self.vol_period = config.volume_sma_period
-        # Track previous alert state to avoid spamming
-        self._last_alert = {}
-
-    def analyze(self, pair, df, holdings, current_price):
-        """Analyze a watchlist coin and return alert info."""
-        df = df.copy()
-        df["ema_fast"] = ta_lib.trend.ema_indicator(df["close"], window=self.ema_fast)
-        df["ema_slow"] = ta_lib.trend.ema_indicator(df["close"], window=self.ema_slow)
-        df["rsi"] = ta_lib.momentum.rsi(df["close"], window=self.rsi_period)
-        df["vol_sma"] = df["volume"].rolling(window=self.vol_period).mean()
-        df["vol_ratio"] = df["volume"] / df["vol_sma"]
-
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
-        rsi = curr["rsi"]
-        ema_f = curr["ema_fast"]
-        ema_s = curr["ema_slow"]
-        vol_ratio = curr["vol_ratio"] if not pd.isna(curr["vol_ratio"]) else 0.0
-
-        # Price drop from recent high (last 50 candles)
-        recent_high = df["high"].tail(50).max()
-        drop_pct = ((current_price - recent_high) / recent_high) * 100
-
-        # EMA crossover detection
-        cross_up = (prev["ema_fast"] <= prev["ema_slow"]) and (ema_f > ema_s)
-
-        # Determine alert level
-        alert = "WAIT"
-        reasons = []
-        strength = 0
-
-        # Strong buy: RSI oversold
-        if rsi <= self.rsi_oversold:
-            alert = "STRONG BUY"
-            reasons.append(f"RSI {rsi:.0f} - oversold!")
-            strength = 3
-        # Buy zone: RSI approaching oversold
-        elif rsi <= self.rsi_buy_zone:
-            alert = "BUY ZONE"
-            reasons.append(f"RSI {rsi:.0f} - approaching oversold")
-            strength = 2
-        # Golden cross happening
-        elif cross_up:
-            alert = "BUY SIGNAL"
-            reasons.append("EMA golden cross - momentum turning up")
-            strength = 2
-
-        # Big dip
-        if drop_pct <= -5:
-            if alert == "WAIT":
-                alert = "DIP ALERT"
-            reasons.append(f"{drop_pct:.1f}% from recent high")
-            strength = max(strength, 2)
-        elif drop_pct <= -3:
-            reasons.append(f"{drop_pct:.1f}% pullback")
-            strength = max(strength, 1)
-
-        # Volume spike (unusual activity)
-        if vol_ratio >= 2.0:
-            reasons.append(f"Volume {vol_ratio:.1f}x avg - unusual activity")
-            strength = max(strength, 1)
-
-        if not reasons:
-            trend = "bullish" if ema_f > ema_s else "bearish"
-            reasons.append(f"Trend: {trend} | RSI {rsi:.0f} | No dip yet")
-
-        value = holdings * current_price
-
-        return {
-            "pair": pair,
-            "price": current_price,
-            "holdings": holdings,
-            "value": value,
-            "rsi": rsi,
-            "ema_fast": ema_f,
-            "ema_slow": ema_s,
-            "volume_ratio": vol_ratio,
-            "drop_pct": drop_pct,
-            "alert": alert,
-            "reasons": reasons,
-            "strength": strength,
-        }
-
-
 # ── Risk Manager ─────────────────────────────────────────────────────────────
 
 
@@ -582,7 +456,7 @@ class RiskManager:
         if side == "buy" and usd_amount < self.min_trade:
             return False, f"Below min trade (${self.min_trade:.2f})"
         if side == "sell" and not portfolio.has_position:
-            return False, "No DOGE to sell"
+            return False, "Nothing to sell"
         return True, "OK"
 
 
@@ -601,14 +475,13 @@ class Portfolio:
             self.crypto_balance = saved["crypto_balance"]
             self.avg_entry_price = saved["avg_entry_price"]
         else:
-            # Start with DOGE, not USD
             self.usd_balance = 0.0
-            self.crypto_balance = config.initial_doge
-            self.avg_entry_price = 0.0  # Will be set on first price fetch
+            self.crypto_balance = config.initial_crypto
+            self.avg_entry_price = 0.0
 
     @property
     def has_position(self):
-        return self.crypto_balance > 0.5  # DOGE dust threshold
+        return self.crypto_balance > 0.5
 
     def total_value(self, price):
         return self.usd_balance + (self.crypto_balance * price)
@@ -770,18 +643,6 @@ def pnl_color(val):
     return "dim"
 
 
-def alert_style(alert):
-    if alert == "STRONG BUY":
-        return "bold bright_green"
-    elif alert == "BUY ZONE":
-        return "bold green"
-    elif alert == "BUY SIGNAL":
-        return "bold cyan"
-    elif alert == "DIP ALERT":
-        return "bold yellow"
-    return "dim"
-
-
 # ── Panel Renderers ──────────────────────────────────────────────────────────
 
 
@@ -791,82 +652,25 @@ def render_header(config, portfolio, price):
     now = datetime.datetime.now()
 
     text = Text()
-    text.append("  CRYPTO TRADER", style="bold bright_white")
+    text.append(f"  {config.coin_name} TRADER", style="bold bright_white")
     text.append(f"  v{VERSION}", style="dim")
     text.append("  |  ", style="dim")
-    text.append(f"DOGE trader + XRP/SOL alerts", style="bold cyan")
+    text.append(config.pair, style="bold cyan")
     text.append("  |  ", style="dim")
     text.append(mode, style=mode_style)
     text.append("  |  ", style="dim")
-    text.append(now.strftime("%H:%M:%S"), style="yellow")
+    text.append(now.strftime("%Y-%m-%d %H:%M:%S"), style="yellow")
 
     return Panel(Align.center(text), border_style="bright_blue", style="on dark_blue")
 
 
-def render_watchlist(watch_data, price_histories):
-    """Render buy alerts for XRP and SOL."""
-    content = Text()
-
-    if not watch_data:
-        content.append("  Loading watchlist...\n", style="dim")
-        return Panel(content, title="[bold]Buy Alerts - XRP & SOL[/]", border_style="cyan")
-
-    for data in watch_data:
-        coin = data["pair"].replace("/USD", "")
-        price = data["price"]
-        rsi = data["rsi"]
-        alert = data["alert"]
-        drop = data["drop_pct"]
-        value = data["value"]
-        holdings = data["holdings"]
-
-        # Coin header
-        content.append(f"  {coin}", style="bold bright_white")
-        content.append(f"  {format_usd(price)}", style="bright_white")
-        if drop < -1:
-            content.append(f"  {drop:+.1f}%", style="bold red")
-        elif drop > 1:
-            content.append(f"  {drop:+.1f}%", style="bold green")
-        content.append("\n")
-
-        # Holdings
-        content.append(f"    Hold: {format_crypto(holdings)} = {format_usd(value)}", style="dim")
-        content.append("\n")
-
-        # Sparkline
-        hist = price_histories.get(data["pair"])
-        if hist and len(hist) > 1:
-            content.append("    ")
-            content.append_text(make_sparkline(hist, "bright_cyan"))
-            content.append("\n")
-
-        # RSI bar
-        rsi_color = "green" if rsi < 30 else "red" if rsi > 70 else "yellow"
-        bar_w = 15
-        rsi_fill = min(int((rsi / 100) * bar_w), bar_w)
-        content.append("    RSI: ", style="dim")
-        content.append("\u2588" * rsi_fill, style=rsi_color)
-        content.append("\u2591" * (bar_w - rsi_fill), style="dim")
-        content.append(f" {rsi:.0f}", style=f"bold {rsi_color}")
-        content.append("\n")
-
-        # Alert status
-        content.append("    >> ", style="dim")
-        content.append(alert, style=alert_style(alert))
-        if data["reasons"]:
-            content.append(f" - {data['reasons'][0]}", style="bright_white")
-        content.append("\n\n")
-
-    return Panel(content, title="[bold]Buy Alerts - XRP & SOL[/]", border_style="cyan")
-
-
-def render_doge_trader(price, analysis, price_history, portfolio):
-    """Render the DOGE day trading panel."""
+def render_price(price, analysis, price_history, coin_name):
     content = Text()
 
     if price > 0:
-        content.append("  DOGE: ", style="dim")
-        content.append(f"{format_usd(price)}", style="bold bright_white")
+        content.append(f"  {coin_name}: ", style="dim")
+        content.append(format_usd(price), style="bold bright_white")
+
         if len(price_history) > 1:
             chg = ((price - price_history[0]) / price_history[0]) * 100
             color = "green" if chg >= 0 else "red"
@@ -875,59 +679,103 @@ def render_doge_trader(price, analysis, price_history, portfolio):
 
         content.append("  ")
         content.append_text(make_sparkline(price_history, "bright_yellow"))
-        content.append("\n")
+        content.append("\n\n")
     else:
-        content.append("  Waiting for price...\n", style="dim")
+        content.append("  Waiting for data...\n\n", style="dim")
 
-    # Portfolio summary
-    total = portfolio.total_value(price) if price > 0 else 0
-    content.append(f"\n  DOGE: {format_crypto(portfolio.crypto_balance)}", style="bright_white")
-    content.append(f"  USD: {format_usd(portfolio.usd_balance)}", style="bright_white")
-    content.append(f"\n  Value: ", style="dim")
-    content.append(f"{format_usd(total)}", style="bold bright_white")
+    if analysis:
+        content.append(f"  EMA(9): ", style="dim")
+        content.append(format_usd(analysis["ema_fast"]), style="cyan")
+        content.append(f"   EMA(21): ", style="dim")
+        content.append(f"{format_usd(analysis['ema_slow'])}\n", style="cyan")
+
+        rsi = analysis["rsi"]
+        rsi_color = "green" if rsi < 30 else "red" if rsi > 70 else "yellow"
+        content.append("  RSI: ", style="dim")
+        content.append(f"{rsi:.1f}", style=f"bold {rsi_color}")
+
+        vr = analysis["volume_ratio"]
+        content.append("   Vol: ", style="dim")
+        content.append(f"{vr:.1f}x avg", style="bright_white")
+
+        trend = "BULLISH" if analysis["ema_fast"] > analysis["ema_slow"] else "BEARISH"
+        t_color = "green" if trend == "BULLISH" else "red"
+        content.append("   Trend: ", style="dim")
+        content.append(trend, style=f"bold {t_color}")
+        content.append("\n")
+
+    return Panel(content, title="[bold]Price & Trend[/]", border_style="cyan")
+
+
+def render_portfolio(portfolio, price, coin_name):
+    content = Text()
+    content.append("  USD:    ", style="dim")
+    content.append(f"{format_usd(portfolio.usd_balance)}\n", style="bright_white")
+
+    content.append(f"  {coin_name}:   ", style="dim")
+    content.append(f"{format_crypto(portfolio.crypto_balance)}\n", style="bright_white")
+
+    total = portfolio.total_value(price) if price > 0 else portfolio.usd_balance
+    content.append("  Value:  ", style="dim")
+    content.append(f"{format_usd(total)}\n", style="bold bright_white")
 
     if portfolio.has_position and portfolio.avg_entry_price > 0 and price > 0:
         pnl = portfolio.unrealized_pnl(price)
         pnl_pct = portfolio.unrealized_pnl_pct(price)
-        content.append(f"  P&L: ", style="dim")
-        content.append(f"{format_usd(pnl)} ({pnl_pct:+.1f}%)", style=pnl_color(pnl))
+        content.append("  P&L:    ", style="dim")
+        content.append(f"{format_usd(pnl)} ({pnl_pct:+.2f}%)\n", style=pnl_color(pnl))
+    else:
+        content.append("  P&L:    ", style="dim")
+        content.append("--\n", style="dim")
+
+    content.append("\n  Mode:   ", style="dim")
+    if portfolio.mode == "paper":
+        content.append("PAPER TRADING", style="bold yellow")
+    else:
+        content.append("LIVE TRADING", style="bold red")
     content.append("\n")
 
-    # Strategy info
-    if analysis:
-        sig = analysis["signal"]
-        sig_colors = {"BUY": "bold green", "SELL": "bold red", "HOLD": "dim yellow"}
-        content.append(f"\n  Signal: ", style="dim")
-        content.append(sig, style=sig_colors.get(sig, "dim"))
+    return Panel(content, title="[bold]Portfolio[/]", border_style="green")
 
-        rsi = analysis["rsi"]
-        rsi_color = "green" if rsi < 30 else "red" if rsi > 70 else "yellow"
-        content.append(f"  RSI: ", style="dim")
-        content.append(f"{rsi:.0f}", style=f"bold {rsi_color}")
 
-        trend = "UP" if analysis["ema_fast"] > analysis["ema_slow"] else "DOWN"
-        t_color = "green" if trend == "UP" else "red"
-        content.append(f"  Trend: ", style="dim")
-        content.append(trend, style=f"bold {t_color}")
-        content.append("\n")
+def render_signals(analysis):
+    content = Text()
+    if not analysis:
+        content.append("  Waiting for first analysis...\n", style="dim")
+        return Panel(content, title="[bold]Signal[/]", border_style="dim")
 
-        for r in analysis["reasons"][:2]:
-            content.append(f"    {r}\n", style="dim")
+    sig = analysis["signal"]
+    sig_color = {"BUY": "bold green", "SELL": "bold red", "HOLD": "dim yellow"}
+    content.append("  Signal: ", style="dim")
+    content.append(sig, style=sig_color.get(sig, "dim"))
+    content.append("\n")
 
-    return Panel(content, title="[bold]DOGE Day Trader[/]", border_style="yellow")
+    conf = analysis["confidence"]
+    bar_width = 15
+    filled = int(conf * bar_width)
+    content.append("  Confidence: ", style="dim")
+    content.append("\u2588" * filled, style="green" if conf >= 0.5 else "yellow")
+    content.append("\u2591" * (bar_width - filled), style="dim")
+    content.append(f" {conf:.0%}\n\n", style="bright_white")
+
+    content.append("  Reasons:\n", style="dim")
+    for r in analysis["reasons"]:
+        content.append(f"   - {r}\n", style="bright_white")
+
+    return Panel(content, title="[bold]Signal[/]", border_style="magenta")
 
 
 def render_position(portfolio, price, config):
     content = Text()
     if not portfolio.has_position:
-        content.append("  No DOGE position\n", style="dim")
+        content.append("  No position open\n", style="dim")
         content.append(f"  USD ready: {format_usd(portfolio.usd_balance)}\n", style="bright_white")
         content.append("  Waiting for BUY signal...\n", style="dim")
         return Panel(content, title="[bold]Position[/]", border_style="dim")
 
     entry = portfolio.avg_entry_price
     if entry <= 0:
-        content.append(f"  Holding {format_crypto(portfolio.crypto_balance)} DOGE\n", style="bright_white")
+        content.append(f"  Holding {format_crypto(portfolio.crypto_balance)} {config.coin_name}\n", style="bright_white")
         content.append("  Entry price pending...\n", style="dim")
         return Panel(content, title="[bold]Position[/]", border_style="yellow")
 
@@ -956,12 +804,12 @@ def render_position(portfolio, price, config):
     return Panel(content, title="[bold]Position[/]", border_style="yellow")
 
 
-def render_trades(recent_trades):
+def render_trades(recent_trades, coin_name):
     table = Table(expand=True, show_header=True, header_style="bold")
     table.add_column("Time", no_wrap=True, width=8)
     table.add_column("Side", no_wrap=True, width=4)
     table.add_column("Price", no_wrap=True, justify="right")
-    table.add_column("DOGE", no_wrap=True, justify="right")
+    table.add_column(coin_name, no_wrap=True, justify="right")
     table.add_column("P&L", no_wrap=True, justify="right")
     table.add_column("Why", no_wrap=True, max_width=12)
 
@@ -982,13 +830,13 @@ def render_trades(recent_trades):
             t["signal"] or "",
         )
 
-    return Panel(table, title=f"[bold]DOGE Trades ({len(recent_trades)})[/]", border_style="red")
+    return Panel(table, title=f"[bold]Trades ({len(recent_trades)})[/]", border_style="red")
 
 
 def render_log(messages, poll_interval, elapsed):
     remaining = max(0, poll_interval - elapsed)
     content = Text()
-    recent = list(messages)[-3:] if messages else []
+    recent = list(messages)[-2:] if messages else []
     for msg in recent:
         content.append(f"  {msg}\n", style="dim")
     content.append(f"  Next poll: {remaining:.0f}s", style="bright_cyan")
@@ -1002,19 +850,18 @@ def build_layout():
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="body", ratio=1),
-        Layout(name="bottom", size=12),
-        Layout(name="footer", size=6),
+        Layout(name="upper", size=11),
+        Layout(name="middle", size=13),
+        Layout(name="trades", ratio=1),
+        Layout(name="footer", size=5),
     )
-    # Left: watchlist alerts, Right: DOGE trader
-    layout["body"].split_row(
-        Layout(name="watchlist", ratio=1),
-        Layout(name="trader", ratio=1),
+    layout["upper"].split_row(
+        Layout(name="price", ratio=3),
+        Layout(name="portfolio", ratio=2),
     )
-    # Bottom: position + trade history
-    layout["bottom"].split_row(
-        Layout(name="position", ratio=2),
-        Layout(name="trades", ratio=3),
+    layout["middle"].split_row(
+        Layout(name="signals", ratio=1),
+        Layout(name="position", ratio=1),
     )
     return layout
 
@@ -1043,21 +890,18 @@ def main():
     portfolio = Portfolio(db, config)
     risk = RiskManager(config, db)
     strategy = Strategy(config)
-    alert_analyzer = AlertAnalyzer(config)
     executor = TradeExecutor(config, exchange, portfolio, risk, db)
 
     layout = build_layout()
     log_messages = collections.deque(maxlen=50)
-    doge_price_history = collections.deque(maxlen=SPARKLINE_WIDTH)
-    watch_price_histories = {w["pair"]: collections.deque(maxlen=SPARKLINE_WIDTH) for w in config.watchlist}
+    price_history = collections.deque(maxlen=SPARKLINE_WIDTH)
     last_analysis = None
-    watch_data = []
-    doge_price = 0.0
+    current_price = 0.0
     last_poll = 0.0
 
     mode_str = "PAPER" if portfolio.mode == "paper" else "LIVE"
     log_messages.append(f"Started in {mode_str} mode")
-    log_messages.append(f"Trading DOGE/USD | Watching XRP, SOL")
+    log_messages.append(f"Trading {config.pair} on {config.exchange_id}")
 
     with Live(
         layout, console=console, refresh_per_second=2,
@@ -1068,69 +912,58 @@ def main():
 
             if (now - last_poll) >= config.poll_interval or last_poll == 0:
                 last_poll = now
-
-                # ── Fetch DOGE data ──
                 try:
-                    ticker = exchange.fetch_ticker("DOGE/USD")
-                    doge_price = ticker["last"]
-                    doge_price_history.append(doge_price)
+                    ticker = exchange.fetch_ticker(config.pair)
+                    current_price = ticker["last"]
+                    price_history.append(current_price)
 
-                    # Set entry price on first run if holding DOGE
                     if portfolio.has_position and portfolio.avg_entry_price <= 0:
-                        portfolio.avg_entry_price = doge_price
+                        portfolio.avg_entry_price = current_price
                         portfolio._save()
-                        log_messages.append(f"Set DOGE entry: {format_usd(doge_price)}")
+                        log_messages.append(f"Set entry: {format_usd(current_price)}")
 
-                    raw = exchange.fetch_ohlcv("DOGE/USD", config.timeframe, limit=200)
-                    db.save_candles("DOGE/USD", config.timeframe, raw)
-                    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    raw = exchange.fetch_ohlcv(config.pair, config.timeframe, limit=200)
+                    db.save_candles(config.pair, config.timeframe, raw)
+                    df = pd.DataFrame(
+                        raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
+                    )
 
                     min_rows = config.ema_slow + 5
                     if len(df) >= min_rows:
                         last_analysis = strategy.analyze(df)
                         log_messages.append(
-                            f"DOGE {format_usd(doge_price)} | {last_analysis['signal']} ({last_analysis['confidence']:.0%})"
+                            f"{config.coin_name} {format_usd(current_price)} | "
+                            f"{last_analysis['signal']} ({last_analysis['confidence']:.0%})"
                         )
-                        result = executor.execute(last_analysis, doge_price)
+                        result = executor.execute(last_analysis, current_price)
                         if result["action"] not in ("HOLD",):
-                            log_messages.append(f">>> DOGE {result['action']} at {format_usd(doge_price)}")
+                            log_messages.append(
+                                f">>> {result['action']} at {format_usd(current_price)}"
+                            )
+                    else:
+                        log_messages.append(f"Need {min_rows} candles, got {len(df)}")
+
+                except ccxt.NetworkError as e:
+                    log_messages.append(f"Network error: {e}")
+                except ccxt.ExchangeError as e:
+                    log_messages.append(f"Exchange error: {e}")
                 except Exception as e:
-                    log_messages.append(f"DOGE error: {type(e).__name__}: {e}")
-
-                # ── Fetch watchlist data ──
-                watch_data = []
-                for w in config.watchlist:
-                    pair = w["pair"]
-                    holdings = w["holdings"]
-                    try:
-                        wticker = exchange.fetch_ticker(pair)
-                        wprice = wticker["last"]
-                        watch_price_histories[pair].append(wprice)
-
-                        wraw = exchange.fetch_ohlcv(pair, config.timeframe, limit=100)
-                        wdf = pd.DataFrame(wraw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-
-                        if len(wdf) >= config.ema_slow + 5:
-                            wdata = alert_analyzer.analyze(pair, wdf, holdings, wprice)
-                            watch_data.append(wdata)
-                            coin = pair.replace("/USD", "")
-                            if wdata["alert"] != "WAIT":
-                                log_messages.append(
-                                    f"{coin}: {wdata['alert']} - {wdata['reasons'][0]}"
-                                )
-                                db.log_alert(pair, wdata["alert"], wdata["reasons"][0])
-                    except Exception as e:
-                        log_messages.append(f"{pair} error: {type(e).__name__}: {e}")
+                    log_messages.append(f"Error: {type(e).__name__}: {e}")
 
             # ── Render ──
             elapsed = now - last_poll
-            layout["header"].update(render_header(config, portfolio, doge_price))
-            layout["body"]["watchlist"].update(render_watchlist(watch_data, watch_price_histories))
-            layout["body"]["trader"].update(
-                render_doge_trader(doge_price, last_analysis, doge_price_history, portfolio)
+            layout["header"].update(render_header(config, portfolio, current_price))
+            layout["upper"]["price"].update(
+                render_price(current_price, last_analysis, price_history, config.coin_name)
             )
-            layout["bottom"]["position"].update(render_position(portfolio, doge_price, config))
-            layout["bottom"]["trades"].update(render_trades(db.get_recent_trades(8)))
+            layout["upper"]["portfolio"].update(
+                render_portfolio(portfolio, current_price, config.coin_name)
+            )
+            layout["middle"]["signals"].update(render_signals(last_analysis))
+            layout["middle"]["position"].update(
+                render_position(portfolio, current_price, config)
+            )
+            layout["trades"].update(render_trades(db.get_recent_trades(10), config.coin_name))
             layout["footer"].update(render_log(log_messages, config.poll_interval, elapsed))
 
             time.sleep(0.5)

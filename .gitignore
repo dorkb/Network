@@ -1,5 +1,6 @@
 accounts.txt
 config.json
+alerts_config.json
 trades.db
 __pycache__/
 .claude/
