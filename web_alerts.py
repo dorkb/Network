@@ -12,9 +12,9 @@ import time
 
 import numpy as np
 import pandas as pd
-from flask import Flask, Response
+from flask import Flask, Response, request
 
-from alerts import Config, ExchangeClient, AlertAnalyzer
+from alerts import Config, ExchangeClient, AlertAnalyzer, CONFIG_PATH
 
 # ── App & State ─────────────────────────────────────────────────────────────
 
@@ -27,6 +27,7 @@ alert_log = collections.deque(maxlen=50)
 log_messages = collections.deque(maxlen=50)
 last_update_time = ""
 poll_countdown = 0
+reload_event = threading.Event()
 
 
 # ── Background Poller ───────────────────────────────────────────────────────
@@ -50,6 +51,27 @@ def poll_loop():
         log_messages.append(f"Watching: {coins_str}")
 
     while True:
+        # Check if config was changed via the web UI
+        if reload_event.is_set():
+            reload_event.clear()
+            config = Config()
+            analyzer = AlertAnalyzer(config)
+            # Init price histories for any new pairs
+            for w in config.watchlist:
+                if w["pair"] not in price_histories:
+                    price_histories[w["pair"]] = collections.deque(maxlen=40)
+            # Remove data for deleted pairs
+            current_pairs = {w["pair"] for w in config.watchlist}
+            for pair in list(coin_data.keys()):
+                if pair not in current_pairs:
+                    with data_lock:
+                        coin_data.pop(pair, None)
+                        price_histories.pop(pair, None)
+            with data_lock:
+                coins_str = ", ".join(w["pair"].replace("/USD", "") for w in config.watchlist)
+                log_messages.append(f"Config reloaded: {coins_str}")
+            last_poll = 0.0  # Force immediate poll
+
         now = time.monotonic()
 
         if (now - last_poll) >= config.poll_interval or last_poll == 0:
@@ -122,8 +144,13 @@ def poll_loop():
 
 def get_snapshot():
     with data_lock:
+        try:
+            watchlist = Config().watchlist
+        except Exception:
+            watchlist = []
         snapshot = {
             "coins": [],
+            "watchlist": watchlist,
             "alert_log": list(alert_log)[:10],
             "log_messages": list(log_messages)[-3:],
             "last_update": last_update_time,
@@ -182,6 +209,89 @@ def api_data():
     return json.dumps(get_snapshot()), 200, {"Content-Type": "application/json"}
 
 
+@app.route("/api/watchlist")
+def api_watchlist():
+    config = Config()
+    return json.dumps(config.watchlist), 200, {"Content-Type": "application/json"}
+
+
+@app.route("/api/watchlist", methods=["POST"])
+def api_add_coin():
+    """Add a new coin. Body: {"pair": "BTC/USD", "holdings": 0.5}"""
+    body = request.get_json(silent=True)
+    if not body or "pair" not in body:
+        return json.dumps({"error": "pair is required"}), 400, {"Content-Type": "application/json"}
+
+    pair = body["pair"].upper().strip()
+    if not pair.endswith("/USD"):
+        pair = pair + "/USD"
+    holdings = float(body.get("holdings", 0))
+
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+
+    # Check if already exists
+    for w in cfg["watchlist"]:
+        if w["pair"] == pair:
+            return json.dumps({"error": f"{pair} already in watchlist"}), 400, {"Content-Type": "application/json"}
+
+    cfg["watchlist"].append({"pair": pair, "holdings": holdings})
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    reload_event.set()
+    return json.dumps({"ok": True, "watchlist": cfg["watchlist"]}), 200, {"Content-Type": "application/json"}
+
+
+@app.route("/api/watchlist", methods=["PUT"])
+def api_edit_coin():
+    """Edit holdings. Body: {"pair": "XRP/USD", "holdings": 800}"""
+    body = request.get_json(silent=True)
+    if not body or "pair" not in body or "holdings" not in body:
+        return json.dumps({"error": "pair and holdings required"}), 400, {"Content-Type": "application/json"}
+
+    pair = body["pair"].upper().strip()
+    holdings = float(body["holdings"])
+
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+
+    found = False
+    for w in cfg["watchlist"]:
+        if w["pair"] == pair:
+            w["holdings"] = holdings
+            found = True
+            break
+
+    if not found:
+        return json.dumps({"error": f"{pair} not in watchlist"}), 404, {"Content-Type": "application/json"}
+
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    reload_event.set()
+    return json.dumps({"ok": True, "watchlist": cfg["watchlist"]}), 200, {"Content-Type": "application/json"}
+
+
+@app.route("/api/watchlist", methods=["DELETE"])
+def api_remove_coin():
+    """Remove a coin. Body: {"pair": "BTC/USD"}"""
+    body = request.get_json(silent=True)
+    if not body or "pair" not in body:
+        return json.dumps({"error": "pair is required"}), 400, {"Content-Type": "application/json"}
+
+    pair = body["pair"].upper().strip()
+
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+
+    before = len(cfg["watchlist"])
+    cfg["watchlist"] = [w for w in cfg["watchlist"] if w["pair"] != pair]
+
+    if len(cfg["watchlist"]) == before:
+        return json.dumps({"error": f"{pair} not in watchlist"}), 404, {"Content-Type": "application/json"}
+
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    reload_event.set()
+    return json.dumps({"ok": True, "watchlist": cfg["watchlist"]}), 200, {"Content-Type": "application/json"}
+
+
 # ── HTML ────────────────────────────────────────────────────────────────────
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -189,6 +299,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <title>Crypto Alerts</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -661,6 +772,152 @@ footer {
     gap: 8px;
 }
 
+/* Settings Modal */
+.settings-btn {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid var(--border);
+    color: var(--dim);
+    padding: 6px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all 0.2s;
+}
+
+.settings-btn:hover { background: rgba(255,255,255,0.12); color: var(--text); }
+
+.modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 100;
+    justify-content: center;
+    align-items: center;
+    padding: 20px;
+}
+
+.modal-overlay.open { display: flex; }
+
+.modal {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px;
+    width: 100%;
+    max-width: 440px;
+    max-height: 85vh;
+    overflow-y: auto;
+    animation: fadeIn 0.3s ease;
+}
+
+.modal h2 {
+    font-size: 1.1rem;
+    margin-bottom: 20px;
+    color: var(--text);
+}
+
+.modal-close {
+    float: right;
+    background: none;
+    border: none;
+    color: var(--dim);
+    font-size: 1.5rem;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0 4px;
+}
+
+.modal-close:hover { color: var(--text); }
+
+.wl-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 10px;
+}
+
+.wl-item .wl-pair {
+    font-weight: 600;
+    min-width: 80px;
+}
+
+.wl-item input {
+    width: 90px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 6px 10px;
+    font-size: 0.85rem;
+}
+
+.wl-item input:focus {
+    outline: none;
+    border-color: var(--cyan);
+}
+
+.wl-btn {
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: none;
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-weight: 600;
+    transition: all 0.2s;
+}
+
+.wl-btn.save { background: rgba(63,185,80,0.15); color: var(--green); }
+.wl-btn.save:hover { background: rgba(63,185,80,0.3); }
+.wl-btn.remove { background: rgba(248,81,73,0.1); color: var(--red); }
+.wl-btn.remove:hover { background: rgba(248,81,73,0.25); }
+
+.add-form {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+    flex-wrap: wrap;
+}
+
+.add-form input {
+    flex: 1;
+    min-width: 80px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 10px 12px;
+    font-size: 0.9rem;
+}
+
+.add-form input:focus { outline: none; border-color: var(--cyan); }
+
+.add-form input::placeholder { color: var(--dim); }
+
+.add-btn {
+    padding: 10px 20px;
+    background: linear-gradient(135deg, var(--cyan), var(--purple));
+    border: none;
+    border-radius: 8px;
+    color: white;
+    font-weight: 700;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: opacity 0.2s;
+}
+
+.add-btn:hover { opacity: 0.85; }
+
+.modal-msg {
+    font-size: 0.82rem;
+    margin-top: 10px;
+    min-height: 20px;
+}
+
 /* Responsive */
 @media (max-width: 480px) {
     main { grid-template-columns: 1fr; padding: 12px; gap: 14px; }
@@ -682,10 +939,25 @@ footer {
         <span id="clock">--:--:--</span>
         <span class="status-dot" id="status-dot"></span>
         <span id="countdown">--</span>
+        <button class="settings-btn" onclick="openSettings()">Settings</button>
     </div>
 </header>
 
-<main id="cards"></main>
+<div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeSettings()">
+    <div class="modal">
+        <button class="modal-close" onclick="closeSettings()">&times;</button>
+        <h2>Watchlist</h2>
+        <div id="wl-list"></div>
+        <div class="add-form">
+            <input type="text" id="add-pair" placeholder="Coin (e.g. BTC)">
+            <input type="number" id="add-holdings" placeholder="Holdings" step="any" min="0">
+            <button class="add-btn" onclick="addCoin()">Add</button>
+        </div>
+        <div class="modal-msg" id="modal-msg"></div>
+    </div>
+</div>
+
+<main id="cards"><div style="text-align:center;padding:40px;color:#8b949e">Loading data...</div></main>
 
 <div class="history-section">
     <div class="history-title">Alert History</div>
@@ -701,303 +973,276 @@ footer {
 </footer>
 
 <script>
-const ALERT_COLORS = {
+var ALERT_COLORS = {
     "STRONG BUY": "#3fb950", "BUY ZONE": "#2ea043", "BUY SIGNAL": "#58a6ff",
     "DIP ALERT": "#d29922", "OVERBOUGHT": "#f85149", "CAUTION": "#ff6b6b", "WAIT": "#8b949e"
 };
 
-const ALERT_BG = {
+var ALERT_BG = {
     "STRONG BUY": "rgba(63,185,80,0.2)", "BUY ZONE": "rgba(46,160,67,0.15)",
     "BUY SIGNAL": "rgba(88,166,255,0.15)", "DIP ALERT": "rgba(210,153,34,0.15)",
     "OVERBOUGHT": "rgba(248,81,73,0.15)", "CAUTION": "rgba(255,107,107,0.15)",
     "WAIT": "rgba(139,148,158,0.1)"
 };
 
-let prevPrices = {};
+var prevPrices = {};
+var currentWatchlist = [];
+var firstLoad = true;
 
 function formatUSD(n) {
     if (n == null) return "--";
-    return Math.abs(n) >= 1 ? "$" + n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})
-                             : "$" + n.toFixed(4);
+    if (Math.abs(n) >= 1) return "$" + n.toFixed(2);
+    return "$" + n.toFixed(4);
 }
 
-function glowClass(alert) {
-    if (["STRONG BUY","BUY ZONE","BUY SIGNAL"].includes(alert)) return "glow-green";
-    if (["OVERBOUGHT","CAUTION"].includes(alert)) return "glow-red";
-    if (alert === "DIP ALERT") return "glow-yellow";
+function glowClass(a) {
+    if (a === "STRONG BUY" || a === "BUY ZONE" || a === "BUY SIGNAL") return "glow-green";
+    if (a === "OVERBOUGHT" || a === "CAUTION") return "glow-red";
+    if (a === "DIP ALERT") return "glow-yellow";
     return "";
+}
+
+function rsiColor(rsi) {
+    if (rsi <= 30) return "#3fb950";
+    if (rsi >= 70) return "#f85149";
+    return "#d29922";
+}
+
+function bottomColor(s) {
+    if (s >= 7) return "#3fb950";
+    if (s >= 4) return "#d29922";
+    return "#8b949e";
+}
+
+function bottomLabel(s) {
+    if (s >= 7) return "LIKELY BOTTOM";
+    if (s >= 4) return "GETTING CLOSE";
+    return "NOT YET";
+}
+
+function bbDotColor(p) {
+    if (p <= 0.2) return "#3fb950";
+    if (p >= 0.8) return "#f85149";
+    return "#d29922";
 }
 
 function drawSparkline(canvas, prices) {
     if (!prices || prices.length < 2) return;
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
+    var dpr = window.devicePixelRatio || 1;
+    var rect = canvas.getBoundingClientRect();
+    if (rect.width === 0) return;
     canvas.width = rect.width * dpr;
     canvas.height = rect.height * dpr;
-    const ctx = canvas.getContext("2d");
+    var ctx = canvas.getContext("2d");
     ctx.scale(dpr, dpr);
-    const w = rect.width, h = rect.height;
+    var w = rect.width, h = rect.height;
     ctx.clearRect(0, 0, w, h);
 
-    const min = Math.min(...prices), max = Math.max(...prices);
-    const range = max - min || 1;
-
-    const pts = prices.map((p, i) => ({
-        x: (i / (prices.length - 1)) * w,
-        y: h - ((p - min) / range) * (h - 6) - 3
-    }));
+    var min = Math.min.apply(null, prices);
+    var max = Math.max.apply(null, prices);
+    var range = max - min || 1;
 
     // Area fill
-    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    var grad = ctx.createLinearGradient(0, 0, 0, h);
     grad.addColorStop(0, "rgba(88,166,255,0.25)");
     grad.addColorStop(1, "rgba(88,166,255,0)");
     ctx.beginPath();
     ctx.moveTo(0, h);
-    pts.forEach(p => ctx.lineTo(p.x, p.y));
+    for (var i = 0; i < prices.length; i++) {
+        var x = (i / (prices.length - 1)) * w;
+        var y = h - ((prices[i] - min) / range) * (h - 6) - 3;
+        ctx.lineTo(x, y);
+    }
     ctx.lineTo(w, h);
     ctx.fillStyle = grad;
     ctx.fill();
 
     // Line
     ctx.beginPath();
-    pts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+    for (var i = 0; i < prices.length; i++) {
+        var x = (i / (prices.length - 1)) * w;
+        var y = h - ((prices[i] - min) / range) * (h - 6) - 3;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
     ctx.strokeStyle = "#58a6ff";
     ctx.lineWidth = 2;
     ctx.lineJoin = "round";
     ctx.stroke();
-
-    // End dot
-    const last = pts[pts.length - 1];
-    ctx.beginPath();
-    ctx.arc(last.x, last.y, 3, 0, Math.PI * 2);
-    ctx.fillStyle = "#58a6ff";
-    ctx.fill();
-}
-
-function rsiColor(rsi) {
-    if (rsi <= 30) return "var(--green)";
-    if (rsi >= 70) return "var(--red)";
-    return "var(--yellow)";
-}
-
-function bottomColor(score) {
-    if (score >= 7) return "var(--green)";
-    if (score >= 4) return "var(--yellow)";
-    return "var(--dim)";
-}
-
-function bottomLabel(score) {
-    if (score >= 7) return "LIKELY BOTTOM";
-    if (score >= 4) return "GETTING CLOSE";
-    return "NOT YET";
-}
-
-function bbDotColor(pct) {
-    if (pct <= 0.2) return "var(--green)";
-    if (pct >= 0.8) return "var(--red)";
-    return "var(--yellow)";
 }
 
 function renderCoinCard(coin) {
-    const id = "card-" + coin.coin;
-    let card = document.getElementById(id);
-    const isNew = !card;
-    if (isNew) {
+    var id = "card-" + coin.coin;
+    var card = document.getElementById(id);
+    if (!card) {
         card = document.createElement("div");
         card.className = "card";
         card.id = id;
         document.getElementById("cards").appendChild(card);
     }
 
-    const alert = coin.alert || "WAIT";
-    const alertColor = ALERT_COLORS[alert] || "#8b949e";
-    const alertBg = ALERT_BG[alert] || "rgba(139,148,158,0.1)";
+    var alert = coin.alert || "WAIT";
+    var alertColor = ALERT_COLORS[alert] || "#8b949e";
+    var alertBg = ALERT_BG[alert] || "rgba(139,148,158,0.1)";
     card.className = "card " + glowClass(alert);
 
-    const rsi = coin.rsi != null ? coin.rsi : 0;
-    const rsi1h = coin.rsi_1h;
-    const bbPct = coin.bb_pct != null ? coin.bb_pct : 0.5;
-    const drop = coin.drop_pct || 0;
-    const vol = coin.volume_ratio || 0;
-    const bscore = coin.bottom_score || 0;
-    const emaF = coin.ema_fast;
-    const emaS = coin.ema_slow;
-    const trend = emaF > emaS ? "bullish" : "bearish";
-    const trendColor = trend === "bullish" ? "var(--green)" : "var(--red)";
+    var rsi = coin.rsi != null ? coin.rsi : 0;
+    var rsi1h = coin.rsi_1h;
+    var bbPct = coin.bb_pct != null ? coin.bb_pct : 0.5;
+    var drop = coin.drop_pct || 0;
+    var vol = coin.volume_ratio || 0;
+    var bscore = coin.bottom_score || 0;
+    var emaF = coin.ema_fast;
+    var emaS = coin.ema_slow;
+    var trend = emaF > emaS ? "bullish" : "bearish";
+    var trendColor = trend === "bullish" ? "#3fb950" : "#f85149";
 
-    // Price change animation
-    let priceClass = "";
-    if (prevPrices[coin.coin] !== undefined && prevPrices[coin.coin] !== coin.price) {
-        priceClass = coin.price > prevPrices[coin.coin] ? "flash-green" : "flash-red";
-    }
-    prevPrices[coin.coin] = coin.price;
+    var dropText = "";
+    if (drop < -1) dropText = '<span class="price-change" style="color:#f85149">' + drop.toFixed(1) + '% from high</span>';
+    else if (drop > -0.5) dropText = '<span class="price-change" style="color:#3fb950">near high</span>';
+    else dropText = '<span class="price-change" style="color:#8b949e">' + drop.toFixed(1) + '%</span>';
 
-    let dropHtml;
-    if (drop < -1) dropHtml = '<span class="price-change" style="color:var(--red)">' + drop.toFixed(1) + '% from high</span>';
-    else if (drop > -0.5) dropHtml = '<span class="price-change" style="color:var(--green)">near high</span>';
-    else dropHtml = '<span class="price-change" style="color:var(--dim)">' + drop.toFixed(1) + '%</span>';
+    var rsiTag = "";
+    if (rsi <= 30) rsiTag = '<span class="ind-tag" style="background:rgba(63,185,80,0.15);color:#3fb950">OVERSOLD</span>';
+    else if (rsi >= 70) rsiTag = '<span class="ind-tag" style="background:rgba(248,81,73,0.15);color:#f85149">OVERBOUGHT</span>';
 
-    // RSI label
-    let rsiLabel = "";
-    if (rsi <= 30) rsiLabel = '<span class="ind-tag" style="background:rgba(63,185,80,0.15);color:var(--green)">OVERSOLD</span>';
-    else if (rsi >= 70) rsiLabel = '<span class="ind-tag" style="background:rgba(248,81,73,0.15);color:var(--red)">OVERBOUGHT</span>';
-
-    // 1h RSI
-    let rsi1hHtml = "";
+    var rsi1hHtml = "";
     if (rsi1h != null) {
-        const r1c = rsi1h <= 35 ? "var(--green)" : rsi1h >= 65 ? "var(--red)" : "var(--yellow)";
-        let r1tag = "";
-        if (rsi1h <= 35) r1tag = '<span class="ind-tag" style="background:rgba(63,185,80,0.15);color:var(--green)">OVERSOLD 1H</span>';
-        else if (rsi1h >= 65) r1tag = '<span class="ind-tag" style="background:rgba(248,81,73,0.15);color:var(--red)">OVERBOUGHT 1H</span>';
+        var r1c = rsi1h <= 35 ? "#3fb950" : rsi1h >= 65 ? "#f85149" : "#d29922";
+        var r1tag = "";
+        if (rsi1h <= 35) r1tag = '<span class="ind-tag" style="background:rgba(63,185,80,0.15);color:#3fb950">OVERSOLD 1H</span>';
+        else if (rsi1h >= 65) r1tag = '<span class="ind-tag" style="background:rgba(248,81,73,0.15);color:#f85149">OVERBOUGHT 1H</span>';
         rsi1hHtml = '<div class="ind-row"><span class="ind-label">1h RSI</span><div class="bar-track"><div class="bar-fill" style="width:' + rsi1h + '%;background:' + r1c + '"></div></div><span class="ind-value" style="color:' + r1c + '">' + rsi1h.toFixed(0) + '</span>' + r1tag + '</div>';
     }
 
-    // Volume
-    let volTag = vol >= 2.0 ? '<span class="ind-tag" style="background:rgba(210,153,34,0.15);color:var(--yellow)">HIGH</span>' : "";
+    var volTag = vol >= 2.0 ? '<span class="ind-tag" style="background:rgba(210,153,34,0.15);color:#d29922">HIGH</span>' : "";
 
-    // MACD
-    const macdH = coin.macd_hist || 0;
-    const macdUp = coin.macd_turning_up;
-    const macdColor = macdH > 0 ? "var(--green)" : "var(--red)";
-    const macdArrow = macdH > 0 ? "&#9650;" : "&#9660;";
-    let macdTag = macdUp ? '<span class="macd-tag">TURNING UP</span>' : "";
+    var macdH = coin.macd_hist || 0;
+    var macdColor = macdH > 0 ? "#3fb950" : "#f85149";
+    var macdArrow = macdH > 0 ? "&#9650;" : "&#9660;";
+    var macdTag = coin.macd_turning_up ? '<span class="macd-tag">TURNING UP</span>' : "";
 
-    // Support levels
-    let supHtml = "";
+    var supHtml = "";
     if (coin.support_levels && coin.support_levels.length > 0) {
         supHtml = '<div class="ind-row"><span class="ind-label">Support</span><div class="support-row">';
-        coin.support_levels.forEach(s => {
-            const pctAway = ((s - coin.price) / coin.price * 100).toFixed(1);
+        for (var i = 0; i < coin.support_levels.length; i++) {
+            var s = coin.support_levels[i];
+            var pctAway = ((s - coin.price) / coin.price * 100).toFixed(1);
             supHtml += '<span class="support-level">' + formatUSD(s) + ' <span class="support-pct">(' + pctAway + '%)</span></span>';
-        });
+        }
         supHtml += '</div></div>';
     }
 
-    // Buy section
-    const buyDiscount = coin.buy_discount || 0;
-    const discColor = buyDiscount < 0 ? "var(--green)" : "var(--red)";
+    var buyDiscount = coin.buy_discount || 0;
+    var discColor = buyDiscount < 0 ? "#3fb950" : "#f85149";
 
-    // Bottom signals
-    let sigHtml = "";
+    var sigHtml = "";
     if (coin.bottom_signals) {
-        coin.bottom_signals.forEach(s => {
-            const active = s !== "No bottom signals yet" ? "active" : "";
-            sigHtml += '<div class="bottom-signal ' + active + '">' + s + '</div>';
-        });
+        for (var i = 0; i < coin.bottom_signals.length; i++) {
+            var active = coin.bottom_signals[i] !== "No bottom signals yet" ? "active" : "";
+            sigHtml += '<div class="bottom-signal ' + active + '">' + coin.bottom_signals[i] + '</div>';
+        }
     }
 
-    // Reasons
-    let reasonsHtml = "";
+    var reasonsHtml = "";
     if (coin.reasons) {
-        reasonsHtml = coin.reasons.map(r => "&#8226; " + r).join("<br>");
+        for (var i = 0; i < coin.reasons.length; i++) {
+            reasonsHtml += "&#8226; " + coin.reasons[i];
+            if (i < coin.reasons.length - 1) reasonsHtml += "<br>";
+        }
     }
 
-    card.innerHTML = `
-        <div class="card-header">
-            <span class="coin-name">${coin.coin}</span>
-            <span class="alert-badge" style="background:${alertBg};color:${alertColor}">${alert}</span>
-        </div>
+    var bbPos = Math.max(0, Math.min(1, bbPct)) * 100;
 
-        <div class="price-row">
-            <span class="price-value ${priceClass}">${formatUSD(coin.price)}</span>
-            ${dropHtml}
-        </div>
+    var h = '';
+    h += '<div class="card-header">';
+    h += '<span class="coin-name">' + coin.coin + '</span>';
+    h += '<span class="alert-badge" style="background:' + alertBg + ';color:' + alertColor + '">' + alert + '</span>';
+    h += '</div>';
 
-        <div class="sparkline-wrap"><canvas id="spark-${coin.coin}"></canvas></div>
+    h += '<div class="price-row">';
+    h += '<span class="price-value">' + formatUSD(coin.price) + '</span>';
+    h += dropText;
+    h += '</div>';
 
-        <div class="holdings">
-            <span><span class="label">Holdings </span><span class="val">${coin.holdings} ${coin.coin}</span></span>
-            <span class="val">${formatUSD(coin.value)}</span>
-        </div>
+    h += '<div class="sparkline-wrap"><canvas id="spark-' + coin.coin + '"></canvas></div>';
 
-        <div class="indicators">
-            <div class="ema-row">
-                <span>EMA(9) <span class="ema-val">${formatUSD(emaF)}</span></span>
-                <span>EMA(21) <span class="ema-val">${formatUSD(emaS)}</span></span>
-                <span class="trend-badge" style="background:${trendColor}22;color:${trendColor}">${trend}</span>
-            </div>
+    h += '<div class="holdings">';
+    h += '<span><span class="label">Holdings </span><span class="val">' + coin.holdings + ' ' + coin.coin + '</span></span>';
+    h += '<span class="val">' + formatUSD(coin.value) + '</span>';
+    h += '</div>';
 
-            <div class="ind-row">
-                <span class="ind-label">RSI</span>
-                <div class="bar-track"><div class="bar-fill" style="width:${rsi}%;background:${rsiColor(rsi)}"></div></div>
-                <span class="ind-value" style="color:${rsiColor(rsi)}">${rsi.toFixed(0)}</span>
-                ${rsiLabel}
-            </div>
+    h += '<div class="indicators">';
+    h += '<div class="ema-row">';
+    h += '<span>EMA(9) <span class="ema-val">' + formatUSD(emaF) + '</span></span>';
+    h += '<span>EMA(21) <span class="ema-val">' + formatUSD(emaS) + '</span></span>';
+    h += '<span class="trend-badge" style="background:' + trendColor + '22;color:' + trendColor + '">' + trend + '</span>';
+    h += '</div>';
 
-            ${rsi1hHtml}
+    h += '<div class="ind-row"><span class="ind-label">RSI</span>';
+    h += '<div class="bar-track"><div class="bar-fill" style="width:' + rsi + '%;background:' + rsiColor(rsi) + '"></div></div>';
+    h += '<span class="ind-value" style="color:' + rsiColor(rsi) + '">' + rsi.toFixed(0) + '</span>';
+    h += rsiTag + '</div>';
 
-            <div class="ind-row">
-                <span class="ind-label">Volume</span>
-                <span class="ind-value">${vol.toFixed(1)}x</span>
-                ${volTag}
-            </div>
+    h += rsi1hHtml;
 
-            <div class="ind-row">
-                <span class="ind-label">BB</span>
-                <div class="bb-track">
-                    <div class="bb-mid"></div>
-                    <div class="bb-dot" style="left:calc(${Math.max(0,Math.min(1,bbPct))*100}% - 6px);background:${bbDotColor(bbPct)}"></div>
-                </div>
-                <div class="bb-labels">
-                    <span>${formatUSD(coin.bb_lower)}</span>
-                    <span>${formatUSD(coin.bb_upper)}</span>
-                </div>
-            </div>
+    h += '<div class="ind-row"><span class="ind-label">Volume</span>';
+    h += '<span class="ind-value">' + vol.toFixed(1) + 'x</span>' + volTag + '</div>';
 
-            <div class="ind-row">
-                <span class="ind-label">MACD</span>
-                <span class="macd-val" style="color:${macdColor}">${macdArrow} ${macdH.toFixed(4)}</span>
-                ${macdTag}
-            </div>
+    h += '<div class="ind-row"><span class="ind-label">BB</span>';
+    h += '<div class="bb-track"><div class="bb-mid"></div>';
+    h += '<div class="bb-dot" style="left:calc(' + bbPos + '% - 6px);background:' + bbDotColor(bbPct) + '"></div></div>';
+    h += '<div class="bb-labels"><span>' + formatUSD(coin.bb_lower) + '</span><span>' + formatUSD(coin.bb_upper) + '</span></div></div>';
 
-            ${supHtml}
-        </div>
+    h += '<div class="ind-row"><span class="ind-label">MACD</span>';
+    h += '<span class="macd-val" style="color:' + macdColor + '">' + macdArrow + ' ' + macdH.toFixed(4) + '</span>';
+    h += macdTag + '</div>';
 
-        <div class="buy-section">
-            <div class="buy-price-row">
-                <span style="color:var(--dim);font-size:0.85rem">Buy at</span>
-                <span class="buy-price-val">${formatUSD(coin.buy_price)}</span>
-                <span class="buy-discount" style="color:${discColor}">(${buyDiscount >= 0 ? "+" : ""}${buyDiscount.toFixed(1)}%)</span>
-            </div>
-            <div class="buy-details">
-                <span>EMA support: ${formatUSD(coin.buy_support)}</span>
-                <span>Recent low: ${formatUSD(coin.buy_low)}</span>
-            </div>
-        </div>
+    h += supHtml;
+    h += '</div>';
 
-        <div class="bottom-section">
-            <div class="bottom-header">
-                <span class="bottom-score-label">Bottom</span>
-                <div class="bottom-bar-track"><div class="bottom-bar-fill" style="width:${bscore*10}%"></div></div>
-                <span class="bottom-score-val" style="color:${bottomColor(bscore)}">${bscore}/10</span>
-                <span class="bottom-status" style="background:${bottomColor(bscore)}22;color:${bottomColor(bscore)}">${bottomLabel(bscore)}</span>
-            </div>
-            <div class="bottom-signals">${sigHtml}</div>
-        </div>
+    h += '<div class="buy-section">';
+    h += '<div class="buy-price-row">';
+    h += '<span style="color:#8b949e;font-size:0.85rem">Buy at</span>';
+    h += '<span class="buy-price-val">' + formatUSD(coin.buy_price) + '</span>';
+    h += '<span class="buy-discount" style="color:' + discColor + '">(' + (buyDiscount >= 0 ? "+" : "") + buyDiscount.toFixed(1) + '%)</span>';
+    h += '</div>';
+    h += '<div class="buy-details"><span>EMA support: ' + formatUSD(coin.buy_support) + '</span>';
+    h += '<span>Recent low: ' + formatUSD(coin.buy_low) + '</span></div></div>';
 
-        <div class="alert-box" style="background:${alertBg}">
-            <div class="alert-label" style="color:${alertColor}">${alert}</div>
-            <div class="alert-reasons">${reasonsHtml}</div>
-        </div>
-    `;
+    h += '<div class="bottom-section">';
+    h += '<div class="bottom-header">';
+    h += '<span class="bottom-score-label">Bottom</span>';
+    h += '<div class="bottom-bar-track"><div class="bottom-bar-fill" style="width:' + (bscore * 10) + '%"></div></div>';
+    h += '<span class="bottom-score-val" style="color:' + bottomColor(bscore) + '">' + bscore + '/10</span>';
+    h += '<span class="bottom-status" style="background:' + bottomColor(bscore) + '22;color:' + bottomColor(bscore) + '">' + bottomLabel(bscore) + '</span>';
+    h += '</div>';
+    h += '<div class="bottom-signals">' + sigHtml + '</div></div>';
 
-    // Draw sparkline
-    const sparkCanvas = document.getElementById("spark-" + coin.coin);
-    if (sparkCanvas && coin.price_history) {
-        requestAnimationFrame(() => drawSparkline(sparkCanvas, coin.price_history));
-    }
+    h += '<div class="alert-box" style="background:' + alertBg + '">';
+    h += '<div class="alert-label" style="color:' + alertColor + '">' + alert + '</div>';
+    h += '<div class="alert-reasons">' + reasonsHtml + '</div></div>';
+
+    card.innerHTML = h;
+
+    setTimeout(function() {
+        var sparkCanvas = document.getElementById("spark-" + coin.coin);
+        if (sparkCanvas && coin.price_history) drawSparkline(sparkCanvas, coin.price_history);
+    }, 50);
 }
 
 function renderHistory(alertLog) {
-    const tbody = document.getElementById("history-body");
+    var tbody = document.getElementById("history-body");
     if (!alertLog || alertLog.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="color:var(--dim);text-align:center;padding:12px">No alerts yet</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="4" style="color:#8b949e;text-align:center;padding:12px">No alerts yet</td></tr>';
         return;
     }
-    tbody.innerHTML = alertLog.map(e => {
-        const c = ALERT_COLORS[e.alert] || "#8b949e";
-        return '<tr><td style="color:var(--dim)">' + e.time + '</td><td style="font-weight:600">' + e.coin + '</td><td style="color:' + c + ';font-weight:600">' + e.alert + '</td><td style="color:var(--dim)">' + e.reason + '</td></tr>';
-    }).join("");
+    var rows = "";
+    for (var i = 0; i < alertLog.length; i++) {
+        var e = alertLog[i];
+        var c = ALERT_COLORS[e.alert] || "#8b949e";
+        rows += '<tr><td style="color:#8b949e">' + e.time + '</td><td style="font-weight:600">' + e.coin + '</td><td style="color:' + c + ';font-weight:600">' + e.alert + '</td><td style="color:#8b949e">' + e.reason + '</td></tr>';
+    }
+    tbody.innerHTML = rows;
 }
 
 function renderDashboard(data) {
@@ -1006,22 +1251,136 @@ function renderDashboard(data) {
     document.getElementById("countdown").textContent = "Next: " + data.poll_countdown + "s";
     document.getElementById("status-dot").className = "status-dot";
 
-    if (data.coins) data.coins.forEach(c => renderCoinCard(c));
+    if (data.watchlist) currentWatchlist = data.watchlist;
+
+    if (data.coins && data.coins.length > 0) {
+        if (firstLoad) {
+            document.getElementById("cards").innerHTML = "";
+            firstLoad = false;
+        }
+        for (var i = 0; i < data.coins.length; i++) {
+            renderCoinCard(data.coins[i]);
+        }
+    }
+
     renderHistory(data.alert_log);
 
-    const logEl = document.getElementById("log-messages");
+    var logEl = document.getElementById("log-messages");
     if (data.log_messages) logEl.textContent = data.log_messages.join(" | ");
 }
 
-// SSE connection
-const evtSource = new EventSource("/stream");
-evtSource.onmessage = function(e) {
-    try { renderDashboard(JSON.parse(e.data)); }
-    catch(err) { console.error("Parse error:", err); }
-};
-evtSource.onerror = function() {
-    document.getElementById("status-dot").className = "status-dot offline";
-};
+// ── Settings ──
+
+function openSettings() {
+    document.getElementById("modal-overlay").classList.add("open");
+    renderWatchlist();
+}
+
+function closeSettings() {
+    document.getElementById("modal-overlay").classList.remove("open");
+}
+
+function renderWatchlist() {
+    var list = document.getElementById("wl-list");
+    var html = "";
+    for (var i = 0; i < currentWatchlist.length; i++) {
+        var w = currentWatchlist[i];
+        var coin = w.pair.replace("/USD", "");
+        html += '<div class="wl-item">';
+        html += '<span class="wl-pair">' + coin + '</span>';
+        html += '<input type="number" id="wl-hold-' + i + '" value="' + w.holdings + '" step="any" min="0">';
+        html += '<button class="wl-btn save" onclick="editCoin(&quot;' + w.pair + '&quot;,' + i + ')">Save</button>';
+        html += '<button class="wl-btn remove" onclick="removeCoin(&quot;' + w.pair + '&quot;)">Remove</button>';
+        html += '</div>';
+    }
+    list.innerHTML = html;
+}
+
+function showMsg(msg, color) {
+    var el = document.getElementById("modal-msg");
+    el.textContent = msg;
+    el.style.color = color || "#e6edf3";
+    setTimeout(function() { el.textContent = ""; }, 3000);
+}
+
+function addCoin() {
+    var pairInput = document.getElementById("add-pair");
+    var holdInput = document.getElementById("add-holdings");
+    var pair = pairInput.value.trim();
+    var holdings = parseFloat(holdInput.value) || 0;
+    if (!pair) { showMsg("Enter a coin name", "#f85149"); return; }
+
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/watchlist");
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onload = function() {
+        var data = JSON.parse(xhr.responseText);
+        if (data.error) { showMsg(data.error, "#f85149"); return; }
+        currentWatchlist = data.watchlist;
+        renderWatchlist();
+        pairInput.value = "";
+        holdInput.value = "";
+        showMsg("Added " + pair.toUpperCase(), "#3fb950");
+    };
+    xhr.send(JSON.stringify({pair: pair, holdings: holdings}));
+}
+
+function editCoin(pair, idx) {
+    var input = document.getElementById("wl-hold-" + idx);
+    var holdings = parseFloat(input.value) || 0;
+
+    var xhr = new XMLHttpRequest();
+    xhr.open("PUT", "/api/watchlist");
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onload = function() {
+        var data = JSON.parse(xhr.responseText);
+        if (data.error) { showMsg(data.error, "#f85149"); return; }
+        currentWatchlist = data.watchlist;
+        renderWatchlist();
+        showMsg("Updated " + pair.replace("/USD",""), "#3fb950");
+    };
+    xhr.send(JSON.stringify({pair: pair, holdings: holdings}));
+}
+
+function removeCoin(pair) {
+    var coin = pair.replace("/USD", "");
+    if (!confirm("Remove " + coin + "?")) return;
+
+    var xhr = new XMLHttpRequest();
+    xhr.open("DELETE", "/api/watchlist");
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onload = function() {
+        var data = JSON.parse(xhr.responseText);
+        if (data.error) { showMsg(data.error, "#f85149"); return; }
+        currentWatchlist = data.watchlist;
+        renderWatchlist();
+        var cardEl = document.getElementById("card-" + coin);
+        if (cardEl) cardEl.remove();
+        showMsg("Removed " + coin, "#d29922");
+    };
+    xhr.send(JSON.stringify({pair: pair}));
+}
+
+// ── Data Fetching (polling) ──
+
+function fetchData() {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/api/data");
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            renderDashboard(data);
+        } catch(e) {}
+    };
+    xhr.onerror = function() {
+        document.getElementById("status-dot").className = "status-dot offline";
+    };
+    xhr.send();
+}
+
+// Fetch immediately, then every 3 seconds
+fetchData();
+setInterval(fetchData, 3000);
 </script>
 </body>
 </html>"""
